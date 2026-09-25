@@ -1,8 +1,10 @@
 import http from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { vatBoard } from "./lib/vat-occupancy.js";
+import { applyVatChange } from "./lib/vat-handovers.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "paper-pulp-fermentation.json");
@@ -25,7 +27,8 @@ const seed = {
         }
       ]
     }
-  ]
+  ],
+  "handovers": []
 };
 const fields = [["code","批次编号","text"],["source","原料来源","text"],["vat","浸泡缸","text"],["days","发酵天数","number"],["owner","负责人","text"]];
 const stages = ["入缸","发酵中","可抄纸","异常观察"];
@@ -37,7 +40,9 @@ async function loadDb() {
     await mkdir(dirname(dbPath), { recursive: true });
     await writeFile(dbPath, JSON.stringify(seed, null, 2));
   }
-  return JSON.parse(await readFile(dbPath, "utf8"));
+  const db = JSON.parse(await readFile(dbPath, "utf8"));
+  db.handovers ||= [];
+  return db;
 }
 async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
@@ -84,7 +89,11 @@ function page() {
     .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
+    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:140px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
+    .vat-board { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:10px; }
+    .vat { border:1px solid var(--line); border-radius:6px; padding:10px; display:grid; gap:4px; }
+    .pill.vacant { color:var(--muted); border-style:dashed; }
+    form.vat-change { padding:10px; background:#fafbf9; }
     @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
   </style>
 </head>
@@ -97,11 +106,14 @@ function page() {
     </section>
     <section>
       <div class="stats" id="stats"></div>
+      <div class="panel" style="margin-bottom:14px"><h2>缸位看板 · 在泡 / 空置 / 最近交接</h2><div class="vat-board" id="vatBoard"></div></div>
+      <datalist id="vatNames"></datalist>
       <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
       <div class="panel"><h2>每天记录温度、气味、纤维状态和换水情况，系统统计发酵进度与异常次数。</h2><div class="grid" id="cards"></div></div>
     </section>
   </main>
-  <script>
+  <script type="module">
+    import { initVatHandover, refreshVatBoard, handoverFormHtml } from "/public/vat-handover.js";
     const fields = [["code","批次编号","text"],["source","原料来源","text"],["vat","浸泡缸","text"],["days","发酵天数","number"],["owner","负责人","text"]];
     const stages = ["入缸","发酵中","可抄纸","异常观察"];
     const extraFields = [["temperature","温度"],["smell","气味状态"],["fiber","纤维松散度"],["changedWater","是否换水"],["abnormal","异味或霉点"]];
@@ -132,16 +144,25 @@ function page() {
       document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
       document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
     }
+    function fmtAt(at) {
+      const s = String(at || '');
+      if (s.length <= 10) return s;
+      const d = new Date(s);
+      if (isNaN(d)) return s;
+      const p = n => String(n).padStart(2, '0');
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+    }
     function cardHtml(item) {
       const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
       const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
+      const logs = (item.logs || []).slice().sort((a, b) => String(a.at).localeCompare(String(b.at))).slice(-6).map(l => '<div>'+fmtAt(l.at)+' '+l.step+(l.vat ? ' · '+l.vat : '')+'：'+l.note+'</div>').join('');
+      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button>'+handoverFormHtml(item)+'<div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
-    async function load() { items = await api('/api/items'); render(); }
+    async function load() { items = await api('/api/items'); render(); refreshVatBoard(); }
     createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
     actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
     document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
+    initVatHandover(load);
     renderForms(); load();
   </script>
 </body>
@@ -153,10 +174,18 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
+    if (req.method === "GET" && url.pathname.startsWith("/public/")) {
+      const root = join(__dirname, "public");
+      const file = join(root, decodeURIComponent(url.pathname.slice("/public/".length)));
+      if (!file.startsWith(root + sep) || !existsSync(file)) return send(res, 404, { error: "not_found" });
+      res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
+      return res.end(await readFile(file));
+    }
     if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+    if (req.method === "GET" && url.pathname === "/api/vats") return send(res, 200, { vats: vatBoard(db.items, db.handovers) });
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建纸浆批次" }] };
+      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", vat: input.vat, note: "创建纸浆批次" }] };
       
       db.items.unshift(item);
       await saveDb(db);
@@ -166,11 +195,21 @@ const server = http.createServer(async (req, res) => {
     if (patch && req.method === "PATCH") {
       const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
+      const input = await body(req);
+      delete input.vat; // 缸号只能走换缸交接，直接改号会丢原缸经历
+      Object.assign(item, input);
       item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
+      item.logs.push({ at: new Date().toISOString(), step: "状态", vat: item.vat, note: "更新为" + item.status });
       await saveDb(db);
       return send(res, 200, item);
+    }
+    const vatChange = url.pathname.match(/^\/api\/items\/([^/]+)\/vat-change$/);
+    if (vatChange && req.method === "POST") {
+      const item = db.items.find(x => x.id === vatChange[1] || x.code === vatChange[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      const record = applyVatChange(db, item, await body(req));
+      await saveDb(db);
+      return send(res, 201, record);
     }
     const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
     if (log && req.method === "POST") {
@@ -178,7 +217,7 @@ const server = http.createServer(async (req, res) => {
       if (!item) return send(res, 404, { error: "item_not_found" });
       const input = await body(req);
       item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
+      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", vat: item.vat, note: input.note || "" });
       await saveDb(db);
       return send(res, 201, item);
     }
@@ -190,17 +229,17 @@ const server = http.createServer(async (req, res) => {
       item.logs ||= [];
       const abnormal = String(input.abnormal || "").includes("是") || String(input.abnormal || "").includes("有");
       item.observations ||= [];
-      item.observations.push({ at: new Date().toISOString(), ...input, abnormal });
+      item.observations.push({ at: new Date().toISOString(), ...input, vat: item.vat, abnormal });
       item.days = Number(item.days || 0) + 1;
       item.status = abnormal ? "异常观察" : Number(item.days) >= 7 ? "可抄纸" : "发酵中";
-      item.logs.push({ at: new Date().toISOString(), step: "观察", note: "温度" + (input.temperature || "") + "，" + (input.smell || "") + "，" + (input.fiber || "") });
+      item.logs.push({ at: new Date().toISOString(), step: "观察", vat: item.vat, note: "温度" + (input.temperature || "") + "，" + (input.smell || "") + "，" + (input.fiber || "") });
       await saveDb(db);
       return send(res, 201, item);
     }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
     send(res, 404, { error: "not_found" });
   } catch (error) {
-    send(res, 500, { error: error.message });
+    send(res, error.status || 500, { error: error.message, code: error.code });
   }
 });
 server.listen(port, () => console.log("古法纸浆发酵记录 listening on http://localhost:" + port));
